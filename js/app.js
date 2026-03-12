@@ -1,23 +1,37 @@
 // ============================================
-// Planning Poker - Main Application
+// Planning Poker - P2P with PeerJS
 // ============================================
+// Host'un tarayıcısı sunucu görevi görür.
+// Tüm state host'ta tutulur, değişiklikleri herkese broadcast eder.
+// Diğer oyuncular WebRTC ile doğrudan host'a bağlanır.
 
 const DECKS = {
     fibonacci: ['0', '1', '2', '3', '5', '8', '13', '21', '34', '55', '89', '?', '\u2615'],
     tshirt: ['XS', 'S', 'M', 'L', 'XL', 'XXL', '?', '\u2615']
 };
 
-// App State
+const PEER_PREFIX = 'pp_poker_';
+
+// ============================================
+// APP STATE
+// ============================================
+
 const state = {
-    userId: null,
+    peer: null,
+    peerId: null,
+    isHost: false,
     userName: null,
-    roomId: null,
-    roomRef: null,
-    isAdmin: false,
+    roomCode: null,
     selectedCard: null,
-    revealed: false,
     deck: 'fibonacci',
-    listeners: []
+
+    // Host only: connections & game state
+    connections: {},       // peerId -> DataConnection
+    gameState: null,       // full room state (host is source of truth)
+
+    // Guest only: connection to host
+    hostConnection: null,
+    localState: null       // received from host
 };
 
 // ============================================
@@ -31,6 +45,10 @@ function generateRoomCode() {
         code += chars.charAt(Math.floor(Math.random() * chars.length));
     }
     return code;
+}
+
+function roomCodeToPeerId(code) {
+    return PEER_PREFIX + code.toLowerCase();
 }
 
 function showToast(message, type = 'info') {
@@ -47,11 +65,16 @@ function showScreen(screenId) {
     document.getElementById(screenId).classList.add('active');
 }
 
+function setConnectionStatus(text, ok) {
+    const el = document.getElementById('connection-status');
+    el.textContent = text;
+    el.className = 'connection-badge ' + (ok ? 'connected' : 'disconnected');
+}
+
 // ============================================
-// LOBBY
+// LOBBY UI
 // ============================================
 
-// Tab switching
 document.querySelectorAll('.tab').forEach(tab => {
     tab.addEventListener('click', () => {
         document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -61,7 +84,6 @@ document.querySelectorAll('.tab').forEach(tab => {
     });
 });
 
-// Deck selection
 document.querySelectorAll('.deck-option').forEach(btn => {
     btn.addEventListener('click', () => {
         document.querySelectorAll('.deck-option').forEach(b => b.classList.remove('selected'));
@@ -70,169 +92,227 @@ document.querySelectorAll('.deck-option').forEach(btn => {
     });
 });
 
-// Create Room
-document.getElementById('btn-create').addEventListener('click', async () => {
+// ============================================
+// CREATE ROOM (HOST)
+// ============================================
+
+document.getElementById('btn-create').addEventListener('click', () => {
     const name = document.getElementById('create-name').value.trim();
     const roomName = document.getElementById('create-room-name').value.trim();
 
-    if (!name) {
-        showToast('L\u00fctfen ad\u0131n\u0131z\u0131 girin', 'error');
-        return;
-    }
-    if (!roomName) {
-        showToast('L\u00fctfen oda ad\u0131 girin', 'error');
-        return;
-    }
+    if (!name) { showToast('Lütfen adınızı girin', 'error'); return; }
+    if (!roomName) { showToast('Lütfen oda adı girin', 'error'); return; }
 
-    try {
-        initUser();
-        const roomCode = generateRoomCode();
-        state.roomId = roomCode;
-        state.userName = name;
-        state.isAdmin = true;
+    const roomCode = generateRoomCode();
+    const peerId = roomCodeToPeerId(roomCode);
 
-        const roomRef = db.ref(`rooms/${roomCode}`);
-        await roomRef.set({
-            name: roomName,
-            deck: state.deck,
-            admin: state.userId,
-            story: '',
-            revealed: false,
-            createdAt: firebase.database.ServerValue.TIMESTAMP,
-            players: {
-                [state.userId]: {
-                    name: name,
-                    vote: null,
-                    online: true
-                }
-            }
-        });
+    state.isHost = true;
+    state.userName = name;
+    state.roomCode = roomCode;
 
-        // Update URL hash
+    // Initialize game state
+    state.gameState = {
+        name: roomName,
+        deck: state.deck,
+        story: '',
+        revealed: false,
+        players: {}
+    };
+
+    // Add host as first player
+    state.gameState.players[peerId] = {
+        name: name,
+        vote: null,
+        isHost: true
+    };
+
+    // Create peer with room-based ID
+    state.peer = new Peer(peerId, { debug: 0 });
+
+    state.peer.on('open', (id) => {
+        state.peerId = id;
         window.location.hash = roomCode;
-        enterRoom(roomCode);
-    } catch (err) {
-        showToast('Oda olu\u015fturulamad\u0131: ' + err.message, 'error');
-    }
+        enterRoom();
+        setConnectionStatus('Bağlı (Host)', true);
+        showToast('Oda oluşturuldu!', 'success');
+    });
+
+    state.peer.on('connection', (conn) => {
+        handleNewConnection(conn);
+    });
+
+    state.peer.on('error', (err) => {
+        if (err.type === 'unavailable-id') {
+            showToast('Bu oda kodu kullanımda, tekrar deneyin', 'error');
+        } else {
+            showToast('Bağlantı hatası: ' + err.message, 'error');
+        }
+    });
 });
 
-// Join Room
-document.getElementById('btn-join').addEventListener('click', async () => {
+// ============================================
+// JOIN ROOM (GUEST)
+// ============================================
+
+document.getElementById('btn-join').addEventListener('click', () => {
     const name = document.getElementById('join-name').value.trim();
     const roomCode = document.getElementById('join-room-id').value.trim().toUpperCase();
 
-    if (!name) {
-        showToast('L\u00fctfen ad\u0131n\u0131z\u0131 girin', 'error');
-        return;
-    }
-    if (!roomCode || roomCode.length !== 6) {
-        showToast('Ge\u00e7erli bir oda kodu girin', 'error');
-        return;
-    }
+    if (!name) { showToast('Lütfen adınızı girin', 'error'); return; }
+    if (!roomCode || roomCode.length !== 6) { showToast('Geçerli bir oda kodu girin', 'error'); return; }
 
-    try {
-        initUser();
-        const snapshot = await db.ref(`rooms/${roomCode}`).once('value');
-        if (!snapshot.exists()) {
-            showToast('Oda bulunamad\u0131', 'error');
-            return;
-        }
+    state.isHost = false;
+    state.userName = name;
+    state.roomCode = roomCode;
 
-        state.roomId = roomCode;
-        state.userName = name;
-        state.isAdmin = false;
+    // Create peer with random ID
+    state.peer = new Peer(undefined, { debug: 0 });
 
-        await db.ref(`rooms/${roomCode}/players/${state.userId}`).set({
-            name: name,
-            vote: null,
-            online: true
+    state.peer.on('open', (id) => {
+        state.peerId = id;
+        const hostPeerId = roomCodeToPeerId(roomCode);
+
+        const conn = state.peer.connect(hostPeerId, { reliable: true });
+        state.hostConnection = conn;
+
+        conn.on('open', () => {
+            // Send join message
+            conn.send({ type: 'join', name: name, peerId: id });
+            window.location.hash = roomCode;
+            enterRoom();
+            setConnectionStatus('Bağlı', true);
         });
 
-        window.location.hash = roomCode;
-        enterRoom(roomCode);
-    } catch (err) {
-        showToast('Odaya kat\u0131l\u0131namad\u0131: ' + err.message, 'error');
-    }
+        conn.on('data', (data) => {
+            handleGuestMessage(data);
+        });
+
+        conn.on('close', () => {
+            setConnectionStatus('Bağlantı koptu', false);
+            showToast('Host bağlantısı koptu', 'error');
+        });
+
+        conn.on('error', (err) => {
+            showToast('Bağlantı hatası: ' + err.message, 'error');
+        });
+    });
+
+    state.peer.on('error', (err) => {
+        if (err.type === 'peer-unavailable') {
+            showToast('Oda bulunamadı. Kod doğru mu?', 'error');
+        } else {
+            showToast('Bağlantı hatası: ' + err.message, 'error');
+        }
+    });
 });
 
 // ============================================
-// USER ID (client-side, no auth needed)
+// HOST: Connection & Message Handling
 // ============================================
 
-function getOrCreateUserId() {
-    let id = localStorage.getItem('pp_user_id');
-    if (!id) {
-        id = 'u_' + Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
-        localStorage.setItem('pp_user_id', id);
+function handleNewConnection(conn) {
+    conn.on('open', () => {
+        // Wait for join message
+    });
+
+    conn.on('data', (data) => {
+        if (data.type === 'join') {
+            // Register player
+            state.connections[data.peerId] = conn;
+            state.gameState.players[data.peerId] = {
+                name: data.name,
+                vote: null,
+                isHost: false
+            };
+            showToast(`${data.name} odaya katıldı`, 'success');
+            broadcastState();
+        }
+
+        if (data.type === 'vote') {
+            if (state.gameState.players[data.peerId]) {
+                state.gameState.players[data.peerId].vote = data.value;
+                broadcastState();
+            }
+        }
+    });
+
+    conn.on('close', () => {
+        // Find which player disconnected
+        const peerId = Object.keys(state.connections).find(k => state.connections[k] === conn);
+        if (peerId && state.gameState.players[peerId]) {
+            const name = state.gameState.players[peerId].name;
+            delete state.gameState.players[peerId];
+            delete state.connections[peerId];
+            showToast(`${name} ayrıldı`, 'info');
+            broadcastState();
+        }
+    });
+}
+
+function broadcastState() {
+    // Update local UI
+    renderRoom(state.gameState);
+
+    // Send to all connected peers
+    const msg = { type: 'state', state: state.gameState };
+    Object.values(state.connections).forEach(conn => {
+        if (conn.open) {
+            conn.send(msg);
+        }
+    });
+}
+
+// ============================================
+// GUEST: Message Handling
+// ============================================
+
+function handleGuestMessage(data) {
+    if (data.type === 'state') {
+        state.localState = data.state;
+        renderRoom(data.state);
     }
-    return id;
-}
-
-function initUser() {
-    state.userId = getOrCreateUserId();
 }
 
 // ============================================
-// ROOM
+// ENTER ROOM
 // ============================================
 
-function enterRoom(roomCode) {
-    state.roomRef = db.ref(`rooms/${roomCode}`);
-
+function enterRoom() {
     showScreen('screen-room');
-    document.getElementById('room-code-display').textContent = roomCode;
+    document.getElementById('room-code-display').textContent = state.roomCode;
     document.getElementById('user-display').textContent = state.userName;
 
-    // Set presence
-    const playerRef = db.ref(`rooms/${roomCode}/players/${state.userId}`);
-    playerRef.onDisconnect().update({ online: false });
-
-    // Listen to room data
-    const roomListener = state.roomRef.on('value', snapshot => {
-        if (!snapshot.exists()) {
-            showToast('Oda silindi', 'error');
-            leaveRoom();
-            return;
-        }
-        const data = snapshot.val();
-        renderRoom(data);
-    });
-    state.listeners.push({ ref: state.roomRef, event: 'value', callback: roomListener });
+    if (state.isHost) {
+        renderRoom(state.gameState);
+    }
 }
+
+// ============================================
+// RENDER
+// ============================================
 
 function renderRoom(data) {
-    // Room title
     document.getElementById('room-title').textContent = data.name || 'Oda';
 
-    // Deck
     const deckType = data.deck || 'fibonacci';
+    const revealed = data.revealed || false;
 
-    // Admin check
-    state.isAdmin = data.admin === state.userId;
-    state.revealed = data.revealed || false;
-
-    // Story section - story input visible to admin only
+    // Story section - input visible to host only
     const storyInputRow = document.querySelector('.story-input-row');
     if (storyInputRow) {
-        storyInputRow.style.display = state.isAdmin ? 'flex' : 'none';
+        storyInputRow.style.display = state.isHost ? 'flex' : 'none';
     }
-    document.getElementById('story-text').textContent = data.story || 'Hen\u00fcz bir story belirlenmedi';
+    document.getElementById('story-text').textContent = data.story || 'Henüz bir story belirlenmedi';
 
     // Admin controls
-    const adminControls = document.getElementById('admin-controls');
-    adminControls.style.display = state.isAdmin ? 'flex' : 'none';
+    document.getElementById('admin-controls').style.display = state.isHost ? 'flex' : 'none';
 
-    // Render cards
-    renderCards(deckType);
-
-    // Render players
-    renderPlayers(data.players || {}, data.revealed);
-
-    // Table status
-    renderTableStatus(data.players || {}, data.revealed);
+    renderCards(deckType, revealed);
+    renderPlayers(data.players || {}, revealed);
+    renderTableStatus(data.players || {}, revealed);
 }
 
-function renderCards(deckType) {
+function renderCards(deckType, revealed) {
     const container = document.getElementById('card-deck');
     const cards = DECKS[deckType] || DECKS.fibonacci;
 
@@ -241,7 +321,7 @@ function renderCards(deckType) {
         const card = document.createElement('div');
         card.className = 'poker-card';
         if (state.selectedCard === value) card.classList.add('selected');
-        if (state.revealed) card.classList.add('disabled');
+        if (revealed) card.classList.add('disabled');
         card.textContent = value;
         card.addEventListener('click', () => selectCard(value));
         container.appendChild(card);
@@ -252,9 +332,7 @@ function renderPlayers(players, revealed) {
     const grid = document.getElementById('players-grid');
     grid.innerHTML = '';
 
-    Object.entries(players).forEach(([uid, player]) => {
-        if (!player.online && uid !== state.userId) return;
-
+    Object.entries(players).forEach(([peerId, player]) => {
         const slot = document.createElement('div');
         slot.className = 'player-slot';
 
@@ -276,7 +354,7 @@ function renderPlayers(players, revealed) {
 
         const nameEl = document.createElement('div');
         nameEl.className = 'player-name';
-        if (uid === state.userId) nameEl.classList.add('is-me');
+        if (peerId === state.peerId) nameEl.classList.add('is-me');
         nameEl.textContent = player.name || 'Anonim';
 
         slot.appendChild(card);
@@ -289,16 +367,15 @@ function renderTableStatus(players, revealed) {
     const statusEl = document.getElementById('table-status');
     const resultEl = document.getElementById('vote-result');
 
-    const onlinePlayers = Object.entries(players).filter(([, p]) => p.online !== false);
-    const votedCount = onlinePlayers.filter(([, p]) => p.vote !== null && p.vote !== undefined).length;
-    const totalCount = onlinePlayers.length;
+    const entries = Object.entries(players);
+    const votedCount = entries.filter(([, p]) => p.vote !== null && p.vote !== undefined).length;
+    const totalCount = entries.length;
 
     if (revealed) {
         statusEl.style.display = 'none';
         resultEl.classList.remove('hidden');
 
-        // Calculate results
-        const numericVotes = onlinePlayers
+        const numericVotes = entries
             .map(([, p]) => p.vote)
             .filter(v => v !== null && v !== undefined && v !== '?' && v !== '\u2615')
             .map(v => {
@@ -311,17 +388,13 @@ function renderTableStatus(players, revealed) {
             const avg = numericVotes.reduce((a, b) => a + b, 0) / numericVotes.length;
             document.getElementById('result-avg-value').textContent = avg.toFixed(1);
 
-            // Consensus: check if all same
             const allSame = numericVotes.every(v => v === numericVotes[0]);
             if (allSame) {
                 document.getElementById('result-consensus-value').textContent = '\u2705 Tam';
             } else {
                 const spread = Math.max(...numericVotes) - Math.min(...numericVotes);
-                if (spread <= 2) {
-                    document.getElementById('result-consensus-value').textContent = '\ud83d\udc4d Yak\u0131n';
-                } else {
-                    document.getElementById('result-consensus-value').textContent = '\u26a0\ufe0f Tart\u0131\u015f\u0131n';
-                }
+                document.getElementById('result-consensus-value').textContent =
+                    spread <= 2 ? '\uD83D\uDC4D Yakın' : '\u26a0\ufe0f Tartışın';
             }
         } else {
             document.getElementById('result-avg-value').textContent = '-';
@@ -332,7 +405,7 @@ function renderTableStatus(players, revealed) {
         resultEl.classList.add('hidden');
 
         if (votedCount === 0) {
-            statusEl.textContent = 'Oylar\u0131n\u0131z\u0131 se\u00e7in...';
+            statusEl.textContent = 'Oylarınızı seçin...';
         } else if (votedCount === totalCount) {
             statusEl.textContent = `\u2705 Herkes oy verdi! (${votedCount}/${totalCount})`;
         } else {
@@ -346,59 +419,71 @@ function renderTableStatus(players, revealed) {
 // ============================================
 
 function selectCard(value) {
-    if (state.revealed) return;
+    const currentState = state.isHost ? state.gameState : state.localState;
+    if (currentState && currentState.revealed) return;
 
-    // Toggle: if same card clicked, deselect
+    // Toggle
     if (state.selectedCard === value) {
         state.selectedCard = null;
-        db.ref(`rooms/${state.roomId}/players/${state.userId}/vote`).set(null);
     } else {
         state.selectedCard = value;
-        db.ref(`rooms/${state.roomId}/players/${state.userId}/vote`).set(value);
+    }
+
+    if (state.isHost) {
+        // Host updates directly
+        state.gameState.players[state.peerId].vote = state.selectedCard;
+        broadcastState();
+    } else {
+        // Guest sends vote to host
+        if (state.hostConnection && state.hostConnection.open) {
+            state.hostConnection.send({
+                type: 'vote',
+                peerId: state.peerId,
+                value: state.selectedCard
+            });
+        }
     }
 }
 
-// Set Story
+// Set Story (host only)
 document.getElementById('btn-set-story').addEventListener('click', () => {
+    if (!state.isHost) return;
     const storyInput = document.getElementById('story-input');
     const story = storyInput.value.trim();
     if (!story) return;
-    db.ref(`rooms/${state.roomId}/story`).set(story);
+    state.gameState.story = story;
     storyInput.value = '';
+    broadcastState();
     showToast('Story belirlendi', 'success');
 });
 
-// Reveal
+// Reveal (host only)
 document.getElementById('btn-reveal').addEventListener('click', () => {
-    db.ref(`rooms/${state.roomId}/revealed`).set(true);
+    if (!state.isHost) return;
+    state.gameState.revealed = true;
+    broadcastState();
 });
 
-// Reset
-document.getElementById('btn-reset').addEventListener('click', async () => {
+// Reset (host only)
+document.getElementById('btn-reset').addEventListener('click', () => {
+    if (!state.isHost) return;
     state.selectedCard = null;
-
-    const snapshot = await db.ref(`rooms/${state.roomId}/players`).once('value');
-    const players = snapshot.val() || {};
-    const updates = {};
-    Object.keys(players).forEach(uid => {
-        updates[`players/${uid}/vote`] = null;
+    state.gameState.revealed = false;
+    Object.keys(state.gameState.players).forEach(pid => {
+        state.gameState.players[pid].vote = null;
     });
-    updates['revealed'] = false;
-
-    await db.ref(`rooms/${state.roomId}`).update(updates);
-    showToast('Yeni oylama ba\u015flat\u0131ld\u0131', 'success');
+    broadcastState();
+    showToast('Yeni oylama başlatıldı', 'success');
 });
 
 // Copy Room Code
 document.getElementById('btn-copy-code').addEventListener('click', () => {
-    const code = state.roomId;
-    const url = `${window.location.origin}${window.location.pathname}#${code}`;
+    const url = `${window.location.origin}${window.location.pathname}#${state.roomCode}`;
     navigator.clipboard.writeText(url).then(() => {
-        showToast('Davet linki kopyaland\u0131!', 'success');
+        showToast('Davet linki kopyalandı!', 'success');
     }).catch(() => {
-        // Fallback
-        navigator.clipboard.writeText(code).then(() => {
-            showToast('Oda kodu kopyaland\u0131!', 'success');
+        navigator.clipboard.writeText(state.roomCode).then(() => {
+            showToast('Oda kodu kopyalandı!', 'success');
         });
     });
 });
@@ -409,20 +494,21 @@ document.getElementById('btn-leave').addEventListener('click', () => {
 });
 
 function leaveRoom() {
-    // Cleanup listeners
-    state.listeners.forEach(({ ref, event, callback }) => {
-        ref.off(event, callback);
-    });
-    state.listeners = [];
-
-    if (state.roomId && state.userId) {
-        db.ref(`rooms/${state.roomId}/players/${state.userId}/online`).set(false);
+    if (state.hostConnection) {
+        state.hostConnection.close();
+        state.hostConnection = null;
+    }
+    if (state.peer) {
+        state.peer.destroy();
+        state.peer = null;
     }
 
-    state.roomId = null;
-    state.roomRef = null;
+    state.peerId = null;
+    state.roomCode = null;
     state.selectedCard = null;
-    state.revealed = false;
+    state.connections = {};
+    state.gameState = null;
+    state.localState = null;
     window.location.hash = '';
 
     showScreen('screen-lobby');
@@ -432,10 +518,9 @@ function leaveRoom() {
 // AUTO-JOIN FROM URL HASH
 // ============================================
 
-window.addEventListener('load', async () => {
+window.addEventListener('load', () => {
     const hash = window.location.hash.slice(1);
     if (hash && hash.length === 6) {
-        // Show join tab with room code pre-filled
         document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
         document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
         document.querySelector('[data-tab="join"]').classList.add('active');
@@ -444,16 +529,12 @@ window.addEventListener('load', async () => {
     }
 });
 
-// Handle Enter key on inputs
+// Enter key handlers
 document.querySelectorAll('#screen-lobby input').forEach(input => {
     input.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') {
             const activeTab = document.querySelector('.tab.active').dataset.tab;
-            if (activeTab === 'create') {
-                document.getElementById('btn-create').click();
-            } else {
-                document.getElementById('btn-join').click();
-            }
+            document.getElementById(activeTab === 'create' ? 'btn-create' : 'btn-join').click();
         }
     });
 });

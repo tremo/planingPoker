@@ -294,6 +294,20 @@ body {
     background: var(--primary-light);
     border-radius: 20px;
 }
+.connection-badge {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 20px;
+}
+.connection-badge.connected {
+    background: #d1fae5;
+    color: #065f46;
+}
+.connection-badge.disconnected {
+    background: #fee2e2;
+    color: #991b1b;
+}
 
 /* Story Section */
 .story-section {
