@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Planning Poker</title>
+    <link rel="stylesheet" href="css/style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <!-- Lobby Screen -->
+    <div id="screen-lobby" class="screen active">
+        <div class="lobby-container">
+            <div class="logo">
+                <div class="logo-icon">&#9824;</div>
+                <h1>Planning Poker</h1>
+                <p class="subtitle">Agile takımlar için story point tahminleme aracı</p>
+            </div>
+
+            <div class="lobby-card">
+                <div class="tabs">
+                    <button class="tab active" data-tab="create">Oda Oluştur</button>
+                    <button class="tab" data-tab="join">Odaya Katıl</button>
+                </div>
+
+                <div id="tab-create" class="tab-content active">
+                    <div class="form-group">
+                        <label for="create-name">Adınız</label>
+                        <input type="text" id="create-name" placeholder="Adınızı girin" maxlength="20" autocomplete="off">
+                    </div>
+                    <div class="form-group">
+                        <label for="create-room-name">Oda Adı</label>
+                        <input type="text" id="create-room-name" placeholder="Sprint 24 Planning" maxlength="40" autocomplete="off">
+                    </div>
+                    <div class="form-group">
+                        <label>Kart Destesi</label>
+                        <div class="deck-selector">
+                            <button class="deck-option selected" data-deck="fibonacci">
+                                <span class="deck-label">Fibonacci</span>
+                                <span class="deck-preview">0, 1, 2, 3, 5, 8, 13, 21...</span>
+                            </button>
+                            <button class="deck-option" data-deck="tshirt">
+                                <span class="deck-label">T-Shirt</span>
+                                <span class="deck-preview">XS, S, M, L, XL, XXL</span>
+                            </button>
+                        </div>
+                    </div>
+                    <button id="btn-create" class="btn btn-primary">Oda Oluştur</button>
+                </div>
+
+                <div id="tab-join" class="tab-content">
+                    <div class="form-group">
+                        <label for="join-name">Adınız</label>
+                        <input type="text" id="join-name" placeholder="Adınızı girin" maxlength="20" autocomplete="off">
+                    </div>
+                    <div class="form-group">
+                        <label for="join-room-id">Oda Kodu</label>
+                        <input type="text" id="join-room-id" placeholder="6 haneli oda kodu" maxlength="6" autocomplete="off">
+                    </div>
+                    <button id="btn-join" class="btn btn-primary">Odaya Katıl</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Room Screen -->
+    <div id="screen-room" class="screen">
+        <header class="room-header">
+            <div class="room-info">
+                <h2 id="room-title">Oda</h2>
+                <div class="room-code-wrapper">
+                    <span>Kod: <strong id="room-code-display">------</strong></span>
+                    <button id="btn-copy-code" class="btn-icon" title="Kodu kopyala">&#128203;</button>
+                </div>
+            </div>
+            <div class="header-actions">
+                <span id="user-display" class="user-badge"></span>
+                <button id="btn-leave" class="btn btn-secondary btn-sm">Ayrıl</button>
+            </div>
+        </header>
+
+        <main class="room-main">
+            <!-- Story/Issue Input (only for admin) -->
+            <div id="story-section" class="story-section">
+                <div class="story-input-row">
+                    <input type="text" id="story-input" placeholder="PBI / Story başlığı girin..." maxlength="200" autocomplete="off">
+                    <button id="btn-set-story" class="btn btn-primary btn-sm">Belirle</button>
+                </div>
+                <div id="current-story" class="current-story">
+                    <span class="story-label">Oylanan:</span>
+                    <span id="story-text">Henüz bir story belirlenmedi</span>
+                </div>
+            </div>
+
+            <!-- Voting Table -->
+            <div class="table-area">
+                <div class="poker-table">
+                    <div id="table-status" class="table-status">Oylamayı bekliyor...</div>
+                    <div id="vote-result" class="vote-result hidden">
+                        <div class="result-avg">
+                            <span class="result-label">Ortalama</span>
+                            <span id="result-avg-value" class="result-value">-</span>
+                        </div>
+                        <div class="result-consensus">
+                            <span class="result-label">Konsensüs</span>
+                            <span id="result-consensus-value" class="result-value">-</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Players -->
+            <div id="players-grid" class="players-grid">
+                <!-- Players will be rendered here -->
+            </div>
+
+            <!-- Cards -->
+            <div id="cards-section" class="cards-section">
+                <div id="card-deck" class="card-deck">
+                    <!-- Cards will be rendered here -->
+                </div>
+            </div>
+
+            <!-- Admin Controls -->
+            <div id="admin-controls" class="admin-controls">
+                <button id="btn-reveal" class="btn btn-accent">Kartları Aç</button>
+                <button id="btn-reset" class="btn btn-secondary">Yeni Oylama</button>
+            </div>
+        </main>
+    </div>
+
+    <!-- Toast Container -->
+    <div id="toast-container" class="toast-container"></div>
+
+    <!-- Firebase SDK -->
+    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
+
+    <script src="js/firebase-config.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>
