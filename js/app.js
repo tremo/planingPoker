@@ -85,7 +85,7 @@ document.getElementById('btn-create').addEventListener('click', async () => {
     }
 
     try {
-        await signInAnonymously();
+        initUser();
         const roomCode = generateRoomCode();
         state.roomId = roomCode;
         state.userName = name;
@@ -131,7 +131,7 @@ document.getElementById('btn-join').addEventListener('click', async () => {
     }
 
     try {
-        await signInAnonymously();
+        initUser();
         const snapshot = await db.ref(`rooms/${roomCode}`).once('value');
         if (!snapshot.exists()) {
             showToast('Oda bulunamad\u0131', 'error');
@@ -156,13 +156,20 @@ document.getElementById('btn-join').addEventListener('click', async () => {
 });
 
 // ============================================
-// AUTH
+// USER ID (client-side, no auth needed)
 // ============================================
 
-async function signInAnonymously() {
-    if (state.userId) return;
-    const result = await auth.signInAnonymously();
-    state.userId = result.user.uid;
+function getOrCreateUserId() {
+    let id = localStorage.getItem('pp_user_id');
+    if (!id) {
+        id = 'u_' + Math.random().toString(36).substring(2, 10) + Date.now().toString(36);
+        localStorage.setItem('pp_user_id', id);
+    }
+    return id;
+}
+
+function initUser() {
+    state.userId = getOrCreateUserId();
 }
 
 // ============================================

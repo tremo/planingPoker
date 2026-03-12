@@ -1,25 +1,12 @@
 // ============================================
 // Firebase Configuration
 // ============================================
-// Bu değerleri kendi Firebase projenizden alın:
-// 1. https://console.firebase.google.com adresine gidin
-// 2. Yeni proje oluşturun (veya mevcut projeyi seçin)
-// 3. "Web app" ekleyin (</>  ikonu)
-// 4. Realtime Database'i etkinleştirin (Build > Realtime Database > Create Database)
-// 5. Authentication > Sign-in method > Anonymous'u etkinleştirin
-// 6. Aşağıdaki config değerlerini kendi projenizin değerleriyle değiştirin
+// Sadece 2 adım gerekli:
+// 1. https://console.firebase.google.com > Proje oluştur
+// 2. Build > Realtime Database > Create Database > "Test mode" seç
+// 3. Project Settings (dişli ikonu) > "Add app" > Web (</>) > Config değerlerini kopyala
 //
-// Realtime Database kuralları (güvenlik için):
-// {
-//   "rules": {
-//     "rooms": {
-//       "$roomId": {
-//         ".read": true,
-//         ".write": true
-//       }
-//     }
-//   }
-// }
+// Authentication'a GEREK YOK. Kullanıcı ID'si tarayıcıda oluşturulur.
 
 const firebaseConfig = {
     apiKey: "YOUR_API_KEY",
@@ -34,4 +21,3 @@ const firebaseConfig = {
 // Firebase'i başlat
 firebase.initializeApp(firebaseConfig);
 const db = firebase.database();
-const auth = firebase.auth();
