@@ -1,16 +1,38 @@
 // ============================================
 // Planning Poker - P2P with PeerJS
 // ============================================
-// Host'un tarayıcısı sunucu görevi görür.
-// Tüm state host'ta tutulur, değişiklikleri herkese broadcast eder.
-// Diğer oyuncular WebRTC ile doğrudan host'a bağlanır.
 
 const DECKS = {
     fibonacci: ['0', '1', '2', '3', '5', '8', '13', '21', '34', '55', '89', '?', '\u2615'],
     tshirt: ['XS', 'S', 'M', 'L', 'XL', 'XXL', '?', '\u2615']
 };
 
-const PEER_PREFIX = 'pp_poker_';
+const PEER_PREFIX = 'planpoker-';
+const CONNECT_TIMEOUT = 15000; // 15 saniye
+const MAX_RETRIES = 3;
+
+// ICE sunucuları - NAT/firewall arkasındaki bağlantılar için
+const ICE_SERVERS = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun.relay.metered.ca:80' },
+    {
+        urls: 'turn:openrelay.metered.ca:80',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+    },
+    {
+        urls: 'turn:openrelay.metered.ca:443',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+    },
+    {
+        urls: 'turn:openrelay.metered.ca:443?transport=tcp',
+        username: 'openrelayproject',
+        credential: 'openrelayproject'
+    }
+];
 
 // ============================================
 // APP STATE
@@ -24,14 +46,10 @@ const state = {
     roomCode: null,
     selectedCard: null,
     deck: 'fibonacci',
-
-    // Host only: connections & game state
-    connections: {},       // peerId -> DataConnection
-    gameState: null,       // full room state (host is source of truth)
-
-    // Guest only: connection to host
+    connections: {},
+    gameState: null,
     hostConnection: null,
-    localState: null       // received from host
+    localState: null
 };
 
 // ============================================
@@ -57,7 +75,7 @@ function showToast(message, type = 'info') {
     toast.className = `toast ${type}`;
     toast.textContent = message;
     container.appendChild(toast);
-    setTimeout(() => toast.remove(), 3500);
+    setTimeout(() => toast.remove(), 4000);
 }
 
 function showScreen(screenId) {
@@ -69,6 +87,31 @@ function setConnectionStatus(text, ok) {
     const el = document.getElementById('connection-status');
     el.textContent = text;
     el.className = 'connection-badge ' + (ok ? 'connected' : 'disconnected');
+}
+
+function setButtonLoading(btnId, loading) {
+    const btn = document.getElementById(btnId);
+    if (loading) {
+        btn.dataset.originalText = btn.textContent;
+        btn.textContent = 'Bağlanıyor...';
+        btn.disabled = true;
+    } else {
+        btn.textContent = btn.dataset.originalText || btn.textContent;
+        btn.disabled = false;
+    }
+}
+
+function createPeer(peerId) {
+    const config = {
+        debug: 1,
+        config: {
+            iceServers: ICE_SERVERS
+        }
+    };
+    if (peerId) {
+        return new Peer(peerId, config);
+    }
+    return new Peer(config);
 }
 
 // ============================================
@@ -103,6 +146,8 @@ document.getElementById('btn-create').addEventListener('click', () => {
     if (!name) { showToast('Lütfen adınızı girin', 'error'); return; }
     if (!roomName) { showToast('Lütfen oda adı girin', 'error'); return; }
 
+    setButtonLoading('btn-create', true);
+
     const roomCode = generateRoomCode();
     const peerId = roomCodeToPeerId(roomCode);
 
@@ -110,7 +155,6 @@ document.getElementById('btn-create').addEventListener('click', () => {
     state.userName = name;
     state.roomCode = roomCode;
 
-    // Initialize game state
     state.gameState = {
         name: roomName,
         deck: state.deck,
@@ -119,33 +163,53 @@ document.getElementById('btn-create').addEventListener('click', () => {
         players: {}
     };
 
-    // Add host as first player
     state.gameState.players[peerId] = {
         name: name,
         vote: null,
         isHost: true
     };
 
-    // Create peer with room-based ID
-    state.peer = new Peer(peerId, { debug: 0 });
+    // Timeout for peer creation
+    const timeout = setTimeout(() => {
+        setButtonLoading('btn-create', false);
+        showToast('Sunucuya bağlanılamadı. Tekrar deneyin.', 'error');
+        if (state.peer) { state.peer.destroy(); state.peer = null; }
+    }, CONNECT_TIMEOUT);
+
+    state.peer = createPeer(peerId);
 
     state.peer.on('open', (id) => {
+        clearTimeout(timeout);
+        setButtonLoading('btn-create', false);
         state.peerId = id;
         window.location.hash = roomCode;
         enterRoom();
         setConnectionStatus('Bağlı (Host)', true);
         showToast('Oda oluşturuldu!', 'success');
+        console.log('[HOST] Oda oluşturuldu, PeerID:', id);
     });
 
     state.peer.on('connection', (conn) => {
+        console.log('[HOST] Yeni bağlantı geliyor:', conn.peer);
         handleNewConnection(conn);
     });
 
     state.peer.on('error', (err) => {
+        clearTimeout(timeout);
+        setButtonLoading('btn-create', false);
+        console.error('[HOST] Peer hatası:', err.type, err.message);
         if (err.type === 'unavailable-id') {
             showToast('Bu oda kodu kullanımda, tekrar deneyin', 'error');
         } else {
-            showToast('Bağlantı hatası: ' + err.message, 'error');
+            showToast('Bağlantı hatası: ' + err.type, 'error');
+        }
+    });
+
+    state.peer.on('disconnected', () => {
+        console.log('[HOST] Signaling sunucusundan koptu, yeniden bağlanıyor...');
+        setConnectionStatus('Yeniden bağlanıyor...', false);
+        if (state.peer && !state.peer.destroyed) {
+            state.peer.reconnect();
         }
     });
 });
@@ -165,22 +229,54 @@ document.getElementById('btn-join').addEventListener('click', () => {
     state.userName = name;
     state.roomCode = roomCode;
 
-    // Create peer with random ID
-    state.peer = new Peer(undefined, { debug: 0 });
+    connectToHost(name, roomCode, 0);
+});
+
+function connectToHost(name, roomCode, attempt) {
+    setButtonLoading('btn-join', true);
+
+    if (state.peer && !state.peer.destroyed) {
+        state.peer.destroy();
+    }
+
+    const hostPeerId = roomCodeToPeerId(roomCode);
+
+    console.log(`[JOIN] Deneme ${attempt + 1}/${MAX_RETRIES}, Host: ${hostPeerId}`);
+
+    // Timeout
+    const timeout = setTimeout(() => {
+        console.log('[JOIN] Timeout!');
+        if (attempt < MAX_RETRIES - 1) {
+            showToast(`Bağlantı zaman aşımı. Tekrar deneniyor... (${attempt + 2}/${MAX_RETRIES})`, 'error');
+            connectToHost(name, roomCode, attempt + 1);
+        } else {
+            setButtonLoading('btn-join', false);
+            showToast('Odaya bağlanılamadı. Host çevrimiçi mi?', 'error');
+            if (state.peer) { state.peer.destroy(); state.peer = null; }
+        }
+    }, CONNECT_TIMEOUT);
+
+    state.peer = createPeer(null);
 
     state.peer.on('open', (id) => {
         state.peerId = id;
-        const hostPeerId = roomCodeToPeerId(roomCode);
+        console.log('[JOIN] Peer açıldı:', id, '→ Host\'a bağlanılıyor...');
 
-        const conn = state.peer.connect(hostPeerId, { reliable: true });
+        const conn = state.peer.connect(hostPeerId, {
+            reliable: true,
+            serialization: 'json'
+        });
         state.hostConnection = conn;
 
         conn.on('open', () => {
-            // Send join message
+            clearTimeout(timeout);
+            setButtonLoading('btn-join', false);
+            console.log('[JOIN] Bağlantı kuruldu!');
             conn.send({ type: 'join', name: name, peerId: id });
             window.location.hash = roomCode;
             enterRoom();
             setConnectionStatus('Bağlı', true);
+            showToast('Odaya katıldınız!', 'success');
         });
 
         conn.on('data', (data) => {
@@ -193,18 +289,35 @@ document.getElementById('btn-join').addEventListener('click', () => {
         });
 
         conn.on('error', (err) => {
-            showToast('Bağlantı hatası: ' + err.message, 'error');
+            console.error('[JOIN] Connection error:', err);
         });
     });
 
     state.peer.on('error', (err) => {
+        clearTimeout(timeout);
+        console.error('[JOIN] Peer hatası:', err.type, err.message);
+
         if (err.type === 'peer-unavailable') {
-            showToast('Oda bulunamadı. Kod doğru mu?', 'error');
+            if (attempt < MAX_RETRIES - 1) {
+                showToast(`Oda bulunamadı, tekrar deneniyor... (${attempt + 2}/${MAX_RETRIES})`, 'error');
+                setTimeout(() => connectToHost(name, roomCode, attempt + 1), 1500);
+            } else {
+                setButtonLoading('btn-join', false);
+                showToast('Oda bulunamadı. Kod doğru mu? Host çevrimiçi mi?', 'error');
+            }
         } else {
-            showToast('Bağlantı hatası: ' + err.message, 'error');
+            setButtonLoading('btn-join', false);
+            showToast('Bağlantı hatası: ' + err.type, 'error');
         }
     });
-});
+
+    state.peer.on('disconnected', () => {
+        console.log('[JOIN] Signaling sunucusundan koptu');
+        if (state.peer && !state.peer.destroyed) {
+            state.peer.reconnect();
+        }
+    });
+}
 
 // ============================================
 // HOST: Connection & Message Handling
@@ -212,12 +325,13 @@ document.getElementById('btn-join').addEventListener('click', () => {
 
 function handleNewConnection(conn) {
     conn.on('open', () => {
-        // Wait for join message
+        console.log('[HOST] Connection open from:', conn.peer);
     });
 
     conn.on('data', (data) => {
+        console.log('[HOST] Data received:', data.type);
+
         if (data.type === 'join') {
-            // Register player
             state.connections[data.peerId] = conn;
             state.gameState.players[data.peerId] = {
                 name: data.name,
@@ -237,7 +351,6 @@ function handleNewConnection(conn) {
     });
 
     conn.on('close', () => {
-        // Find which player disconnected
         const peerId = Object.keys(state.connections).find(k => state.connections[k] === conn);
         if (peerId && state.gameState.players[peerId]) {
             const name = state.gameState.players[peerId].name;
@@ -250,14 +363,16 @@ function handleNewConnection(conn) {
 }
 
 function broadcastState() {
-    // Update local UI
     renderRoom(state.gameState);
 
-    // Send to all connected peers
     const msg = { type: 'state', state: state.gameState };
-    Object.values(state.connections).forEach(conn => {
+    Object.entries(state.connections).forEach(([peerId, conn]) => {
         if (conn.open) {
-            conn.send(msg);
+            try {
+                conn.send(msg);
+            } catch (e) {
+                console.error('[HOST] Send error to', peerId, e);
+            }
         }
     });
 }
@@ -297,14 +412,12 @@ function renderRoom(data) {
     const deckType = data.deck || 'fibonacci';
     const revealed = data.revealed || false;
 
-    // Story section - input visible to host only
     const storyInputRow = document.querySelector('.story-input-row');
     if (storyInputRow) {
         storyInputRow.style.display = state.isHost ? 'flex' : 'none';
     }
     document.getElementById('story-text').textContent = data.story || 'Henüz bir story belirlenmedi';
 
-    // Admin controls
     document.getElementById('admin-controls').style.display = state.isHost ? 'flex' : 'none';
 
     renderCards(deckType, revealed);
@@ -422,7 +535,6 @@ function selectCard(value) {
     const currentState = state.isHost ? state.gameState : state.localState;
     if (currentState && currentState.revealed) return;
 
-    // Toggle
     if (state.selectedCard === value) {
         state.selectedCard = null;
     } else {
@@ -430,11 +542,9 @@ function selectCard(value) {
     }
 
     if (state.isHost) {
-        // Host updates directly
         state.gameState.players[state.peerId].vote = state.selectedCard;
         broadcastState();
     } else {
-        // Guest sends vote to host
         if (state.hostConnection && state.hostConnection.open) {
             state.hostConnection.send({
                 type: 'vote',
@@ -445,7 +555,6 @@ function selectCard(value) {
     }
 }
 
-// Set Story (host only)
 document.getElementById('btn-set-story').addEventListener('click', () => {
     if (!state.isHost) return;
     const storyInput = document.getElementById('story-input');
@@ -457,14 +566,12 @@ document.getElementById('btn-set-story').addEventListener('click', () => {
     showToast('Story belirlendi', 'success');
 });
 
-// Reveal (host only)
 document.getElementById('btn-reveal').addEventListener('click', () => {
     if (!state.isHost) return;
     state.gameState.revealed = true;
     broadcastState();
 });
 
-// Reset (host only)
 document.getElementById('btn-reset').addEventListener('click', () => {
     if (!state.isHost) return;
     state.selectedCard = null;
@@ -476,7 +583,6 @@ document.getElementById('btn-reset').addEventListener('click', () => {
     showToast('Yeni oylama başlatıldı', 'success');
 });
 
-// Copy Room Code
 document.getElementById('btn-copy-code').addEventListener('click', () => {
     const url = `${window.location.origin}${window.location.pathname}#${state.roomCode}`;
     navigator.clipboard.writeText(url).then(() => {
@@ -488,7 +594,6 @@ document.getElementById('btn-copy-code').addEventListener('click', () => {
     });
 });
 
-// Leave Room
 document.getElementById('btn-leave').addEventListener('click', () => {
     leaveRoom();
 });
@@ -529,7 +634,6 @@ window.addEventListener('load', () => {
     }
 });
 
-// Enter key handlers
 document.querySelectorAll('#screen-lobby input').forEach(input => {
     input.addEventListener('keydown', (e) => {
         if (e.key === 'Enter') {
